@@ -240,7 +240,10 @@ pub(super) struct Channel<ChanSigner: ChannelKeys> {
 	secp_ctx: Secp256k1<secp256k1::All>,
 	channel_value_satoshis: u64,
 
+	#[cfg(not(test))]
 	local_keys: ChanSigner,
+	#[cfg(test)]
+	pub(super) local_keys: ChanSigner,
 	shutdown_pubkey: PublicKey,
 
 	// Our commitment numbers start at 2^48-1 and count down, whereas the ones used in transaction
@@ -1995,6 +1998,17 @@ impl<ChanSigner: ChannelKeys> Channel<ChanSigner> {
 		self.channel_monitor.provide_secret(self.cur_remote_commitment_transaction_number + 1, msg.per_commitment_secret)
 			.map_err(|e| ChannelError::Close(e.0))?;
 
+		if self.channel_state & ChannelState::AwaitingRemoteRevoke as u32 == 0 {
+			// Our counterparty seems to have burned their coins to us (by revoking a state when we
+			// haven't given them a new commitment transaction to broadcast). We should probably
+			// take advantage of this by updating our channel monitor, sending them an error, and
+			// waiting for them to broadcast their latest (now-revoked claim). But, that would be a
+			// lot of work, and there's some chance this is all a misunderstanding anyway.
+			// We have to do *something*, though, since our signer may get mad at us for otherwise
+			// jumping a remote commitment number, so best to just force-close and move on.
+			return Err(ChannelError::Close("Received an unexpected revoke_and_ack"));
+		}
+
 		// Update state now that we've passed all the can-fail calls...
 		// (note that we may still fail to generate the new commitment_signed message, but that's
 		// OK, we step the channel here and *then* if the new generation fails we can fail the
@@ -2973,49 +2987,8 @@ impl<ChanSigner: ChannelKeys> Channel<ChanSigner> {
 	pub fn block_connected(&mut self, header: &BlockHeader, height: u32, txn_matched: &[&Transaction], indexes_of_txn_matched: &[u32]) -> Result<Option<msgs::FundingLocked>, msgs::ErrorMessage> {
 		let non_shutdown_state = self.channel_state & (!MULTI_STATE_FLAGS);
 		if header.bitcoin_hash() != self.last_block_connected {
-			self.last_block_connected = header.bitcoin_hash();
-			self.channel_monitor.last_block_hash = self.last_block_connected;
 			if self.funding_tx_confirmations > 0 {
 				self.funding_tx_confirmations += 1;
-				if self.funding_tx_confirmations == self.minimum_depth as u64 {
-					let need_commitment_update = if non_shutdown_state == ChannelState::FundingSent as u32 {
-						self.channel_state |= ChannelState::OurFundingLocked as u32;
-						true
-					} else if non_shutdown_state == (ChannelState::FundingSent as u32 | ChannelState::TheirFundingLocked as u32) {
-						self.channel_state = ChannelState::ChannelFunded as u32 | (self.channel_state & MULTI_STATE_FLAGS);
-						self.channel_update_count += 1;
-						true
-					} else if non_shutdown_state == (ChannelState::FundingSent as u32 | ChannelState::OurFundingLocked as u32) {
-						// We got a reorg but not enough to trigger a force close, just update
-						// funding_tx_confirmed_in and return.
-						false
-					} else if self.channel_state < ChannelState::ChannelFunded as u32 {
-						panic!("Started confirming a channel in a state pre-FundingSent?: {}", self.channel_state);
-					} else {
-						// We got a reorg but not enough to trigger a force close, just update
-						// funding_tx_confirmed_in and return.
-						false
-					};
-					self.funding_tx_confirmed_in = Some(header.bitcoin_hash());
-
-					//TODO: Note that this must be a duplicate of the previous commitment point they sent us,
-					//as otherwise we will have a commitment transaction that they can't revoke (well, kinda,
-					//they can by sending two revoke_and_acks back-to-back, but not really). This appears to be
-					//a protocol oversight, but I assume I'm just missing something.
-					if need_commitment_update {
-						if self.channel_state & (ChannelState::MonitorUpdateFailed as u32) == 0 {
-							let next_per_commitment_secret = self.build_local_commitment_secret(self.cur_local_commitment_transaction_number);
-							let next_per_commitment_point = PublicKey::from_secret_key(&self.secp_ctx, &next_per_commitment_secret);
-							return Ok(Some(msgs::FundingLocked {
-								channel_id: self.channel_id,
-								next_per_commitment_point: next_per_commitment_point,
-							}));
-						} else {
-							self.monitor_pending_funding_locked = true;
-							return Ok(None);
-						}
-					}
-				}
 			}
 		}
 		if non_shutdown_state & !(ChannelState::TheirFundingLocked as u32) == ChannelState::FundingSent as u32 {
@@ -3054,6 +3027,51 @@ impl<ChanSigner: ChannelKeys> Channel<ChanSigner> {
 						self.short_channel_id = Some(((height as u64)          << (5*8)) |
 						                             ((*index_in_block as u64) << (2*8)) |
 						                             ((txo_idx as u64)         << (0*8)));
+					}
+				}
+			}
+		}
+		if header.bitcoin_hash() != self.last_block_connected {
+			self.last_block_connected = header.bitcoin_hash();
+			self.channel_monitor.last_block_hash = self.last_block_connected;
+			if self.funding_tx_confirmations > 0 {
+				if self.funding_tx_confirmations == self.minimum_depth as u64 {
+					let need_commitment_update = if non_shutdown_state == ChannelState::FundingSent as u32 {
+						self.channel_state |= ChannelState::OurFundingLocked as u32;
+						true
+					} else if non_shutdown_state == (ChannelState::FundingSent as u32 | ChannelState::TheirFundingLocked as u32) {
+						self.channel_state = ChannelState::ChannelFunded as u32 | (self.channel_state & MULTI_STATE_FLAGS);
+						self.channel_update_count += 1;
+						true
+					} else if non_shutdown_state == (ChannelState::FundingSent as u32 | ChannelState::OurFundingLocked as u32) {
+						// We got a reorg but not enough to trigger a force close, just update
+						// funding_tx_confirmed_in and return.
+						false
+					} else if self.channel_state < ChannelState::ChannelFunded as u32 {
+						panic!("Started confirming a channel in a state pre-FundingSent?: {}", self.channel_state);
+					} else {
+						// We got a reorg but not enough to trigger a force close, just update
+						// funding_tx_confirmed_in and return.
+						false
+					};
+					self.funding_tx_confirmed_in = Some(header.bitcoin_hash());
+
+					//TODO: Note that this must be a duplicate of the previous commitment point they sent us,
+					//as otherwise we will have a commitment transaction that they can't revoke (well, kinda,
+					//they can by sending two revoke_and_acks back-to-back, but not really). This appears to be
+					//a protocol oversight, but I assume I'm just missing something.
+					if need_commitment_update {
+						if self.channel_state & (ChannelState::MonitorUpdateFailed as u32) == 0 {
+							let next_per_commitment_secret = self.build_local_commitment_secret(self.cur_local_commitment_transaction_number);
+							let next_per_commitment_point = PublicKey::from_secret_key(&self.secp_ctx, &next_per_commitment_secret);
+							return Ok(Some(msgs::FundingLocked {
+								channel_id: self.channel_id,
+								next_per_commitment_point: next_per_commitment_point,
+							}));
+						} else {
+							self.monitor_pending_funding_locked = true;
+							return Ok(None);
+						}
 					}
 				}
 			}
